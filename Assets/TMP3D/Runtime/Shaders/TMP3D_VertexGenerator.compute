@@ -1,0 +1,188 @@
+#pragma kernel GenerateBoxVertices
+
+struct VertexData
+{
+    float3 position;
+    float3 normal;
+    float4 color;
+    float2 texcoord0;
+    float2 texcoord1;
+    float4 texcoord2;
+    float4 boundariesUV;
+    float4 boundariesLocal;
+    float4 boundariesLocalZ;
+};
+
+struct CharacterData
+{
+    float depth;
+    float2 depthMapping;
+    float padding;
+};
+
+StructuredBuffer<VertexData> _InputVertices;
+StructuredBuffer<CharacterData> _CharacterData;
+RWStructuredBuffer<VertexData> _OutputVertices;
+RWStructuredBuffer<uint> _OutputIndices;
+
+int _CharacterCount;
+float4x4 _ObjectToWorld;
+float4x4 _WorldToObject;
+
+// Helper function to create a vertex with offset
+VertexData CreateVertex(VertexData input, float3 offset, float4 boundariesUV, float4 boundariesLocal, float4 boundariesLocalZ)
+{
+    VertexData output;
+    
+    float4 worldPos = float4(input.position, 1.0);
+    worldPos.xyz += offset;
+    
+    output.position = mul(_WorldToObject, worldPos).xyz;
+    output.normal = input.normal;
+    output.color = input.color;
+    output.texcoord0 = input.texcoord0;
+    output.texcoord1 = input.texcoord1;
+    output.texcoord2 = input.texcoord2;
+    output.boundariesUV = boundariesUV;
+    output.boundariesLocal = boundariesLocal;
+    output.boundariesLocalZ = boundariesLocalZ;
+    
+    return output;
+}
+
+[numthreads(32, 1, 1)]
+void GenerateBoxVertices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CharacterCount)
+        return;
+    
+    uint charIndex = id.x;
+    uint baseVertexIndex = charIndex * 4; // 4 vertices per character in input
+    uint outputBaseVertex = charIndex * 24; // 24 vertices per box
+    uint outputBaseIndex = charIndex * 36; // 36 indices per box
+    
+    // Get character depth data
+    CharacterData charData = _CharacterData[charIndex];
+    float depth = charData.depth;
+    
+    // Get the 4 vertices of the character quad
+    VertexData v0 = _InputVertices[baseVertexIndex + 0];
+    VertexData v1 = _InputVertices[baseVertexIndex + 1];
+    VertexData v2 = _InputVertices[baseVertexIndex + 2];
+    VertexData v3 = _InputVertices[baseVertexIndex + 3];
+    
+    // Calculate boundaries
+    float3 v0local = mul(_WorldToObject, float4(v0.position, 1)).xyz;
+    float3 v1local = mul(_WorldToObject, float4(v1.position, 1)).xyz;
+    float3 v2local = mul(_WorldToObject, float4(v2.position, 1)).xyz;
+    float3 v3local = mul(_WorldToObject, float4(v3.position, 1)).xyz;
+    
+    float skewLocal = abs(v1local.x - v0local.x);
+    float widthLocal = abs(v3local.x - v0local.x);
+    float heightLocal = abs(v1local.y - v0local.y);
+    float xLocal = min(v0local.x, v3local.x);
+    float yLocal = min(v0local.y, v1local.y);
+    
+    float skewUV = abs(v1.texcoord0.x - v0.texcoord0.x);
+    float widthUV = abs(v3.texcoord0.x - v0.texcoord0.x);
+    float heightUV = abs(v1.texcoord0.y - v0.texcoord0.y);
+    float xUV = min(v0.texcoord0.x, v3.texcoord0.x);
+    float yUV = min(v0.texcoord0.y, v1.texcoord0.y);
+    
+    float4 boundariesUV = float4(xUV, yUV, widthUV, heightUV);
+    float4 boundariesLocal = float4(xLocal, yLocal, widthLocal, heightLocal);
+    float4 boundariesLocalZ = float4(-depth, 0, skewLocal, skewUV);
+    
+    // Normal offset for depth
+    float3 normalOffset = v0.normal * depth;
+    float3 zeroOffset = float3(0, 0, 0);
+    
+    // Generate box vertices (6 faces * 4 vertices = 24 vertices)
+    
+    // Front face (original quad)
+    _OutputVertices[outputBaseVertex + 0] = CreateVertex(v0, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 1] = CreateVertex(v1, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 2] = CreateVertex(v2, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 3] = CreateVertex(v3, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Back face
+    _OutputVertices[outputBaseVertex + 4] = CreateVertex(v3, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 5] = CreateVertex(v2, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 6] = CreateVertex(v1, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 7] = CreateVertex(v0, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Top face
+    _OutputVertices[outputBaseVertex + 8] = CreateVertex(v1, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 9] = CreateVertex(v1, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 10] = CreateVertex(v2, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 11] = CreateVertex(v2, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Bottom face
+    _OutputVertices[outputBaseVertex + 12] = CreateVertex(v0, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 13] = CreateVertex(v0, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 14] = CreateVertex(v3, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 15] = CreateVertex(v3, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Left face
+    _OutputVertices[outputBaseVertex + 16] = CreateVertex(v0, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 17] = CreateVertex(v0, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 18] = CreateVertex(v1, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 19] = CreateVertex(v1, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Right face
+    _OutputVertices[outputBaseVertex + 20] = CreateVertex(v2, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 21] = CreateVertex(v2, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 22] = CreateVertex(v3, zeroOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    _OutputVertices[outputBaseVertex + 23] = CreateVertex(v3, normalOffset, boundariesUV, boundariesLocal, boundariesLocalZ);
+    
+    // Generate indices for the box
+    uint idx = 0;
+    
+    // Front face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 0;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 1;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 2;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 0;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 2;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 3;
+    
+    // Back face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 4;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 5;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 6;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 4;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 6;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 7;
+    
+    // Top face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 8;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 9;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 10;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 8;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 10;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 11;
+    
+    // Bottom face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 12;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 13;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 14;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 12;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 14;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 15;
+    
+    // Left face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 16;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 17;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 18;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 16;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 18;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 19;
+    
+    // Right face
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 20;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 21;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 22;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 20;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 22;
+    _OutputIndices[outputBaseIndex + idx++] = outputBaseVertex + 23;
+}

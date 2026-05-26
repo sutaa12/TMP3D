@@ -1,0 +1,228 @@
+/// <summary>
+/// TextMeshPro の 4 頂点クワッドから、厚み付き Text3D 用の頂点とインデックスを生成する compute shader です。
+/// </summary>
+/// <remarks>
+/// 1 つの論理スレッドが 1 文字クワッドを担当し、前面 4 頂点、背面 4 頂点、側面 8 頂点と 36 インデックスを出力します。
+/// C# 側の Text3DSolidRenderer.SourceGlyphVertex / SolidGlyphVertex と、このファイルの構造体レイアウトは必ず同期させてください。
+/// </remarks>
+
+#pragma kernel BuildText3DGeometry
+#include "UnityCG.cginc"
+
+/// <summary>
+/// C# 側から渡される TMP 由来の入力頂点です。
+/// </summary>
+/// <remarks>
+/// 4 要素が 1 文字クワッドを表します。フィールド順は Text3DSolidRenderer.SourceGlyphVertex と一致させます。
+/// </remarks>
+struct SourceGlyphVertex
+{
+    /// <summary>ローカル空間上の TMP 頂点位置です。</summary>
+    float3 pos;   // ローカル座標
+    /// <summary>フォント SDF アトラスを参照する UV です。</summary>
+    float2 uv0;   // SDF atlas UV
+    /// <summary>x が押し出し量、y/z が奥行き色のマッピング範囲、w は未使用です。</summary>
+    float4 uv3;   // x=depth (押し出し量), y/z=depthMapped(任意), w=未使用
+    /// <summary>Color32 を RGBA8 としてパックした頂点色です。</summary>
+    uint   col;   // Color32 (RGBA8 packed)
+};
+
+/// <summary>
+/// SolidUnlit シェーダーが StructuredBuffer から読む生成済み頂点です。
+/// </summary>
+/// <remarks>
+/// フィールド順は Text3DSolidRenderer.SolidGlyphVertex と Text3DSolidUnlit.shader の SolidGlyphVertex と一致させます。
+/// </remarks>
+struct SolidGlyphVertex
+{
+    /// <summary>押し出し後のローカル空間頂点位置です。</summary>
+    float3 position;
+    /// <summary>前面、背面、側面それぞれのローカル法線です。</summary>
+    float3 normal;
+    /// <summary>0..1 に展開した頂点色です。</summary>
+    float4 color;        // 0..1
+    /// <summary>フォント SDF アトラス UV です。</summary>
+    float2 texcoord0;    // atlas UV
+    /// <summary>TMP 互換用の補助値です。y=1 を非ボールドとして扱います。</summary>
+    float2 texcoord1;    // tmp (x:unused, y:boldFlag) ※既定 y=1=non-bold
+    /// <summary>x が厚み、y/z が奥行き色の参照範囲です。</summary>
+    float4 texcoord2;    // depthData (x:depth, yz:depthMapped, w:unused)
+    /// <summary>アトラス UV 上の文字境界です。</summary>
+    float4 boundariesUV;     // (xMin, yMin, width, height) in atlas
+    /// <summary>ローカル XY 平面上の文字境界です。</summary>
+    float4 boundariesLocal;  // (xMin, yMin, width, height) in local
+    /// <summary>Z 範囲と、斜体補正に使う local/UV の skew 値です。</summary>
+    float4 boundariesLocalZ; // (zMin, zMax, skewLocal, skewUV)
+};
+
+/// <summary>4 頂点で 1 クワッドになる入力頂点バッファです。</summary>
+StructuredBuffer<SourceGlyphVertex>     _SourceGlyphQuads;      // 4 * _GlyphQuadCount 要素（各クオッド連続）
+/// <summary>1 クワッドあたり 16 頂点を出力するバッファです。</summary>
+RWStructuredBuffer<SolidGlyphVertex> _SolidGlyphVertices;  // 16 * _GlyphQuadCount
+/// <summary>1 クワッドあたり 36 インデックスを出力するバッファです。</summary>
+RWStructuredBuffer<uint>       _SolidGlyphIndices;   // 36 * _GlyphQuadCount
+
+/// <summary>処理対象の文字クワッド数です。</summary>
+int      _GlyphQuadCount;
+
+/// <summary>
+/// 文字を押し出す向きです。既定では front が z≈0、back が z=-depth になります。
+/// </summary>
+float3   _DepthDirection = float3(0,0,-1);
+
+/// <summary>
+/// 1 スレッドで 1 文字クワッドを処理し、厚み付き形状の頂点とインデックスを作ります。
+/// </summary>
+/// <param name="id">SV_DispatchThreadID。x が文字クワッド番号になります。</param>
+[numthreads(64, 1, 1)]
+void BuildText3DGeometry (uint3 id : SV_DispatchThreadID)
+{
+    uint q = id.x;
+    if (q >= _GlyphQuadCount) return;
+
+    /// <summary>入力 4 頂点を取り出します。TMP は v0..v3 が BL, TL, TR, BR になることが多いです。</summary>
+    uint sourceStart = q * 4;
+    SourceGlyphVertex v0 = _SourceGlyphQuads[sourceStart + 0];
+    SourceGlyphVertex v1 = _SourceGlyphQuads[sourceStart + 1];
+    SourceGlyphVertex v2 = _SourceGlyphQuads[sourceStart + 2];
+    SourceGlyphVertex v3 = _SourceGlyphQuads[sourceStart + 3];
+
+    /// <summary>同一文字内の 4 頂点から最大の厚みを採用し、背面までの押し出し量にします。</summary>
+    float depth = max(max(v0.uv3.x, v1.uv3.x), max(v2.uv3.x, v3.uv3.x));
+    float3 dir  = normalize(_DepthDirection);
+    float3 depthOffset  = dir * depth;
+
+    /// <summary>レイマーチ時に位置を 0..1 の文字マスク空間へ戻せるよう、UV とローカル座標の境界を計算します。</summary>
+    // UV 側: SDF アトラス内で、その文字が占める矩形と斜体分のずれを求めます。
+    float skewUV   = abs(v1.uv0.x - v0.uv0.x);
+    float widthUV  = abs(v2.uv0.x - v1.uv0.x);
+    float heightUV = abs(v1.uv0.y - v0.uv0.y);
+    float xUV      = min(v0.uv0.x, v2.uv0.x);
+    float yUV      = min(v0.uv0.y, v1.uv0.y);
+    float4 boundariesUV = float4(xUV, yUV, widthUV, heightUV);
+
+    // ローカル座標側: レイマーチ位置から文字内の x/y 進行度を復元するための矩形を求めます。
+    float3 v0l = v0.pos;
+    float3 v1l = v1.pos;
+    float3 v2l = v2.pos;
+
+    float skewLocal   = abs(v1l.x - v0l.x);
+    float widthLocal  = abs(v2l.x - v1l.x);
+    float heightLocal = abs(v1l.y - v0l.y);
+    float xLocal      = min(v0l.x, v2l.x);
+    float yLocal      = min(v0l.y, v1l.y);
+    float4 boundariesLocal  = float4(xLocal, yLocal, widthLocal, heightLocal);
+
+    // Z 範囲は front=0、back=-depth として保持し、mask.z の逆変換に使います。
+    float4 boundariesLocalZ = float4(-depth, 0, skewLocal, skewUV);
+
+    /// <summary>Color32 をシェーダー内で扱いやすい 0..1 の float4 へ展開します。</summary>
+    float4 C0 = float4((v0.col      & 0xFF)/255.0, ((v0.col>>8) & 0xFF)/255.0, ((v0.col>>16)&0xFF)/255.0, ((v0.col>>24)&0xFF)/255.0);
+    float4 C1 = float4((v1.col      & 0xFF)/255.0, ((v1.col>>8) & 0xFF)/255.0, ((v1.col>>16)&0xFF)/255.0, ((v1.col>>24)&0xFF)/255.0);
+    float4 C2 = float4((v2.col      & 0xFF)/255.0, ((v2.col>>8) & 0xFF)/255.0, ((v2.col>>16)&0xFF)/255.0, ((v2.col>>24)&0xFF)/255.0);
+    float4 C3 = float4((v3.col      & 0xFF)/255.0, ((v3.col>>8) & 0xFF)/255.0, ((v3.col>>16)&0xFF)/255.0, ((v3.col>>24)&0xFF)/255.0);
+
+    /// <summary>TextMeshPro 互換の補助値と、文字ごとの奥行き色マッピング情報をまとめます。</summary>
+    float2 tmp1 = float2(0, 1);          // y=1 → 非ボールド（step(input.tmp.y,0)=0）
+    float2 depthMapped = float2(v0.uv3.y, v0.uv3.z);
+    float4 depthData = float4(depth, depthMapped.x, depthMapped.y, 0);
+
+    /// <summary>頂点を 16 個用意します。内訳は front4、back4、側面用 8 頂点です。</summary>
+    uint solidVertexStart = q * 16;
+
+    // front (0..3): 元の 4 頂点をそのまま使い、法線は -Z 方向にします。
+    SolidGlyphVertex o;
+    // 0
+    o.position=v0.pos; o.normal=float3(0,0,-1); o.color=C0; o.texcoord0=v0.uv0; o.texcoord1=tmp1; o.texcoord2=depthData;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+0]=o;
+    // 1
+    o.position=v1.pos; o.normal=float3(0,0,-1); o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+1]=o;
+    // 2
+    o.position=v2.pos; o.normal=float3(0,0,-1); o.color=C2; o.texcoord0=v2.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+2]=o;
+    // 3
+    o.position=v3.pos; o.normal=float3(0,0,-1); o.color=C3; o.texcoord0=v3.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+3]=o;
+
+    // back (4..7): front を depthOffset だけずらし、法線は +Z 方向にします。
+    o.normal=float3(0,0,1);
+    o.position=v0.pos+depthOffset; o.color=C0; o.texcoord0=v0.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+4]=o;
+    o.position=v1.pos+depthOffset; o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+5]=o;
+    o.position=v2.pos+depthOffset; o.color=C2; o.texcoord0=v2.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+6]=o;
+    o.position=v3.pos+depthOffset; o.color=C3; o.texcoord0=v3.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+7]=o;
+
+    // sides: 4 辺それぞれを (frontA, frontB, backA, backB) の 4 頂点で作り、2 三角形で張ります。
+    // edge 0: v0-v1 → verts 8..11
+    float3 edge0 = normalize(v1.pos - v0.pos);
+    float3 n0 = normalize(cross(edge0, dir));  // 外向き法線
+    o.normal=n0;
+    o.position=v0.pos;     o.color=C0; o.texcoord0=v0.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+ 8]=o;
+    o.position=v1.pos;     o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+ 9]=o;
+    o.position=v0.pos+depthOffset; o.color=C0; o.texcoord0=v0.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+10]=o;
+    o.position=v1.pos+depthOffset; o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+11]=o;
+
+    // edge 1: v1-v2 → verts 12..15
+    float3 edge1 = normalize(v2.pos - v1.pos);
+    float3 n1 = normalize(cross(edge1, dir));  // 外向き法線
+    o.normal=n1;
+    o.position=v1.pos;     o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+12]=o;
+    o.position=v2.pos;     o.color=C2; o.texcoord0=v2.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+13]=o;
+    o.position=v1.pos+depthOffset; o.color=C1; o.texcoord0=v1.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+14]=o;
+    o.position=v2.pos+depthOffset; o.color=C2; o.texcoord0=v2.uv0;
+    o.boundariesUV=boundariesUV; o.boundariesLocal=boundariesLocal; o.boundariesLocalZ=boundariesLocalZ;
+    _SolidGlyphVertices[solidVertexStart+15]=o;
+
+    /// <summary>16 頂点を 12 三角形に分解し、合計 36 インデックスとして書き込みます。</summary>
+    uint solidIndexStart = q * 36;
+
+    // front (Bottom 面): GS の Bottom と同じく巻き順を反転 (2,1,0) / (0,3,2)
+    _SolidGlyphIndices[solidIndexStart+ 0]=solidVertexStart+2; _SolidGlyphIndices[solidIndexStart+ 1]=solidVertexStart+1; _SolidGlyphIndices[solidIndexStart+ 2]=solidVertexStart+0;
+    _SolidGlyphIndices[solidIndexStart+ 3]=solidVertexStart+0; _SolidGlyphIndices[solidIndexStart+ 4]=solidVertexStart+3; _SolidGlyphIndices[solidIndexStart+ 5]=solidVertexStart+2;
+
+    // back (Top 面): GS の Top と同じ (0,1,2) / (2,3,0) に相当（こちらは反転しない）
+    _SolidGlyphIndices[solidIndexStart+ 6]=solidVertexStart+4; _SolidGlyphIndices[solidIndexStart+ 7]=solidVertexStart+5; _SolidGlyphIndices[solidIndexStart+ 8]=solidVertexStart+6;
+    _SolidGlyphIndices[solidIndexStart+ 9]=solidVertexStart+6; _SolidGlyphIndices[solidIndexStart+10]=solidVertexStart+7; _SolidGlyphIndices[solidIndexStart+11]=solidVertexStart+4;
+
+    // side 0 (edge v0-v1): (back0, front0, back1) / (front0, front1, back1)
+    _SolidGlyphIndices[solidIndexStart+12]=solidVertexStart+10; _SolidGlyphIndices[solidIndexStart+13]=solidVertexStart+ 8; _SolidGlyphIndices[solidIndexStart+14]=solidVertexStart+11;
+    _SolidGlyphIndices[solidIndexStart+15]=solidVertexStart+ 8; _SolidGlyphIndices[solidIndexStart+16]=solidVertexStart+ 9; _SolidGlyphIndices[solidIndexStart+17]=solidVertexStart+11;
+
+    // side 1 (edge v1-v2): (back1, front1, back2) / (front1, front2, back2)
+    _SolidGlyphIndices[solidIndexStart+18]=solidVertexStart+14; _SolidGlyphIndices[solidIndexStart+19]=solidVertexStart+12; _SolidGlyphIndices[solidIndexStart+20]=solidVertexStart+15;
+    _SolidGlyphIndices[solidIndexStart+21]=solidVertexStart+12; _SolidGlyphIndices[solidIndexStart+22]=solidVertexStart+13; _SolidGlyphIndices[solidIndexStart+23]=solidVertexStart+15;
+
+    // side 2 (edge v2-v3): (back2, front2, back3) / (front2, front3, back3)
+    _SolidGlyphIndices[solidIndexStart+24]=solidVertexStart+6;  _SolidGlyphIndices[solidIndexStart+25]=solidVertexStart+2;  _SolidGlyphIndices[solidIndexStart+26]=solidVertexStart+7;
+    _SolidGlyphIndices[solidIndexStart+27]=solidVertexStart+2;  _SolidGlyphIndices[solidIndexStart+28]=solidVertexStart+3;  _SolidGlyphIndices[solidIndexStart+29]=solidVertexStart+7;
+
+    // edge 3: v3-v0 → 既存 front/back 頂点を流用（back3, front3, back0）/（front3, front0, back0）に統一
+    _SolidGlyphIndices[solidIndexStart+30]=solidVertexStart+7; _SolidGlyphIndices[solidIndexStart+31]=solidVertexStart+3; _SolidGlyphIndices[solidIndexStart+32]=solidVertexStart+4;
+    _SolidGlyphIndices[solidIndexStart+33]=solidVertexStart+3; _SolidGlyphIndices[solidIndexStart+34]=solidVertexStart+0; _SolidGlyphIndices[solidIndexStart+35]=solidVertexStart+4;
+}
