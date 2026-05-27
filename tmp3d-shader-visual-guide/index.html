@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TextMeshPro 3D Shader Visual Guide</title>
+  <meta name="description" content="TextMeshPro の文字が TMP3D と compute shader で3D表示される仕組みを視覚的に説明する静的サイト。">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header" aria-label="サイトヘッダー">
+    <a class="brand" href="#top" aria-label="トップへ戻る">
+      <span class="brand-mark">T3</span>
+      <span>TextMeshPro 3D Shader Guide</span>
+    </a>
+    <nav class="top-nav" aria-label="ページ内ナビゲーション">
+      <a href="#sdf-basics">SDF基礎</a>
+      <a href="#pipeline">全体像</a>
+      <a href="#extrude">押し出し</a>
+      <a href="#raymarch">レイマーチ</a>
+      <a href="#map">対応表</a>
+      <a href="#constraints">制約</a>
+      <a href="#tradeoffs">比較</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="lab-section" aria-labelledby="lab-title">
+      <div class="lab-copy">
+        <p class="eyebrow">Unity / TextMeshPro / Compute Shader</p>
+        <h1 id="lab-title">
+          <span class="title-line">TextMeshProを</span>
+          <span class="title-line">3D文字として</span>
+          <span class="title-line">描く仕組み</span>
+        </h1>
+        <p class="lead">
+          <span class="lead-line">このプロジェクトの</span>
+          <span class="lead-line"><code>CustomUnlit_<wbr>Compute</code> は、</span>
+          <span class="lead-line">TMP文字を厚みのある形へ変換します。</span>
+          <span class="lead-line">SDFでピクセル単位に中身を判定し、</span>
+          <span class="lead-line">処理を「データの旅」として</span>
+          <span class="lead-line">追えるように分解しました。</span>
+        </p>
+      </div>
+
+      <div class="lab-workbench">
+        <div class="stage-area">
+          <canvas id="mainStage" width="1200" height="720" aria-label="TMP3Dのメイン可視化"></canvas>
+          <div class="stage-caption" id="stageCaption">TMPの文字は最初、1文字4頂点の薄い板です。</div>
+        </div>
+
+        <aside class="control-panel" aria-label="可視化コントロール">
+          <div class="step-tabs" role="tablist" aria-label="表示する処理段階">
+            <button class="step-tab is-active" type="button" data-stage="0">1. TMP</button>
+            <button class="step-tab" type="button" data-stage="1">2. Compute</button>
+            <button class="step-tab" type="button" data-stage="2">3. Ray</button>
+            <button class="step-tab" type="button" data-stage="3">4. Shade</button>
+          </div>
+
+          <label class="control-row" for="depthRange">
+            <span>Depth</span>
+            <input id="depthRange" type="range" min="0.15" max="1.35" value="0.72" step="0.01">
+            <output id="depthValue" for="depthRange">0.72</output>
+          </label>
+
+          <label class="control-row" for="outlineRange">
+            <span>Outline</span>
+            <input id="outlineRange" type="range" min="0" max="0.22" value="0.08" step="0.01">
+            <output id="outlineValue" for="outlineRange">0.08</output>
+          </label>
+
+          <label class="control-row" for="rayRange">
+            <span>Ray steps</span>
+            <input id="rayRange" type="range" min="8" max="48" value="28" step="1">
+            <output id="rayValue" for="rayRange">28</output>
+          </label>
+
+          <dl class="stats-grid" aria-label="バッファ統計">
+            <div>
+              <dt>Input quads</dt>
+              <dd id="quadStat">3</dd>
+            </div>
+            <div>
+              <dt>Out vertices</dt>
+              <dd id="vertexStat">48</dd>
+            </div>
+            <div>
+              <dt>Out indices</dt>
+              <dd id="indexStat">108</dd>
+            </div>
+          </dl>
+
+          <p class="panel-note" id="stageText">
+            TMPは文字ごとに四角形を作ります。ここでは “TMP” の3文字なので、入力は3クワッド、つまり12頂点です。
+          </p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="band section-pad" id="sdf-basics" aria-labelledby="sdf-basics-title">
+      <div class="section-head">
+        <p class="eyebrow">TextMeshPro SDF Basics</p>
+        <h2 id="sdf-basics-title">ぼけた画像なのに、なぜ文字がきれいに出るのか</h2>
+        <p>
+          TMPのSDFアトラスは、文字をそのまま写真のように保存している画像ではありません。
+          各ピクセルに「文字の輪郭までどれくらい近いか」をグレー値として入れた距離マップです。
+          だから見た目はぼんやりしていても、シェーダー側で「どこを輪郭にするか」を毎回計算し直せます。
+        </p>
+      </div>
+
+      <div class="sdf-basics-layout">
+        <article class="visual-panel sdf-visual-panel">
+          <h3>SDFは「ぼけ画像」ではなく「距離のメモ」</h3>
+          <canvas id="sdfIntroStage" width="980" height="620" aria-label="TextMeshPro SDFの基本原理"></canvas>
+          <p>
+            左のSDF画像はぼやけて見えますが、真ん中のしきい値で輪郭を決め直すことで、右のようなシャープな文字になります。
+          </p>
+        </article>
+
+        <div class="sdf-principles">
+          <article class="sdf-point">
+            <span class="constraint-kicker">01 / 保存しているもの</span>
+            <h3>白黒の濃さは「距離」</h3>
+            <p>
+              白に近いほど文字の内側、黒に近いほど外側、真ん中のグレー付近が輪郭です。
+              通常画像のような「このピクセルを何色で塗るか」ではなく、輪郭からの距離を圧縮して持っています。
+            </p>
+          </article>
+          <article class="sdf-point">
+            <span class="constraint-kicker">02 / 描くとき</span>
+            <h3>シェーダーが境界を切り出す</h3>
+            <p>
+              描画時にSDF値を読み、だいたい `0.5` を輪郭として扱います。
+              さらに `smoothstep` のような補間で境界幅を調整するので、拡大縮小しても輪郭がギザギザしにくくなります。
+            </p>
+          </article>
+          <article class="sdf-point">
+            <span class="constraint-kicker">03 / 3D化で効く理由</span>
+            <h3>奥行き方向でも同じ輪郭を使える</h3>
+            <p>
+              今回の3D文字では、箱の中の位置をSDFアトラスのUVへ戻して「ここは文字の中か」を判定します。
+              つまり、前面だけでなく奥行き面も同じ距離情報で形を決められます。
+            </p>
+          </article>
+        </div>
+      </div>
+
+      <div class="sdf-formula-strip" aria-label="SDF描画の考え方">
+        <div>
+          <strong>SDF alpha</strong>
+          <span>輪郭までの距離っぽい値</span>
+        </div>
+        <div>
+          <strong>edge = 0.5</strong>
+          <span>この近辺を文字の境界にする</span>
+        </div>
+        <div>
+          <strong>screen scale</strong>
+          <span>画面上の大きさに合わせて境界幅を調整</span>
+        </div>
+        <div>
+          <strong>smooth edge</strong>
+          <span>結果としてシャープで滑らかな文字になる</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="band section-pad" id="pipeline" aria-labelledby="pipeline-title">
+      <div class="section-head">
+        <p class="eyebrow">Pipeline</p>
+        <h2 id="pipeline-title">全体像は「板を作る、厚みを作る、画素を決める」</h2>
+        <p>
+          C#、compute shader、描画シェーダーは同じ仕事をしているのではなく、きれいに役割分担しています。
+          まずCPU側でTMPのメッシュを読み、GPU側で押し出し用バッファを作り、最後にピクセルシェーダーがSDFを見ながら塗ります。
+        </p>
+      </div>
+
+      <div class="pipeline-strip" aria-label="TMP3Dの処理パイプライン">
+        <article class="pipeline-node">
+          <span class="node-index">01</span>
+          <h3>TMP Mesh</h3>
+          <p>TextMeshPro が文字ごとに4頂点のクワッドを生成します。UVはSDFアトラスの位置を指します。</p>
+        </article>
+        <div class="flow-arrow" aria-hidden="true"></div>
+        <article class="pipeline-node">
+          <span class="node-index">02</span>
+          <h3>C# Pack</h3>
+          <p>`TMP3D_ComputeRenderer` が頂点、UV、色、文字のdepthを `InVertex` としてまとめます。</p>
+        </article>
+        <div class="flow-arrow" aria-hidden="true"></div>
+        <article class="pipeline-node">
+          <span class="node-index">03</span>
+          <h3>Compute</h3>
+          <p>`TMP3D_Extrude.compute` が1クワッドを16頂点と36インデックスへ展開します。</p>
+        </article>
+        <div class="flow-arrow" aria-hidden="true"></div>
+        <article class="pipeline-node">
+          <span class="node-index">04</span>
+          <h3>Shader</h3>
+          <p>描画時に `DrawProceduralNow` でバッファを読み、レイマーチとSDFで文字の表面を決めます。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section-pad split-section" id="extrude" aria-labelledby="extrude-title">
+      <div class="section-text">
+        <p class="eyebrow">Extrusion</p>
+        <h2 id="extrude-title">1文字の平面クワッドを、箱のような描画範囲へ押し出す</h2>
+        <p>
+          TMPの文字は、見た目が複雑でもメッシュとしては基本的に四角形です。
+          compute shaderはその四角形を前面、背面、側面に分けて、3D空間でサンプルできる箱を作ります。
+        </p>
+        <ul class="plain-list">
+          <li>入力: 4頂点、UV、色、depth</li>
+          <li>出力: front 4頂点、back 4頂点、side 8頂点</li>
+          <li>インデックス: 12三角形分、合計36個</li>
+        </ul>
+      </div>
+      <div class="visual-panel">
+        <canvas id="quadStage" width="920" height="620" aria-label="クワッド押し出しの図"></canvas>
+      </div>
+    </section>
+
+    <section class="band section-pad" id="raymarch" aria-labelledby="raymarch-title">
+      <div class="section-head">
+        <p class="eyebrow">SDF + Raymarch</p>
+        <h2 id="raymarch-title">立体の中を少しずつ進み、文字の面に当たったら色を置く</h2>
+        <p>
+          SDFは「そのUVが文字の内側にどれくらい近いか」をグレースケールで持つテクスチャです。
+          ピクセルシェーダーは視線方向に小さく進み、現在位置を3Dマスク座標へ変換し、SDFの値がしきい値を越えたところを表面として扱います。
+        </p>
+      </div>
+
+      <div class="dual-visual">
+        <article class="visual-panel">
+          <h3>SDFアトラスの考え方</h3>
+          <canvas id="sdfStage" width="720" height="520" aria-label="SDFアトラスの可視化"></canvas>
+          <p>白に近いほど文字の内側、黒に近いほど外側です。輪郭は0.5付近の境界として扱えます。</p>
+        </article>
+        <article class="visual-panel">
+          <h3>レイマーチの進み方</h3>
+          <canvas id="rayStage" width="720" height="520" aria-label="レイマーチの可視化"></canvas>
+          <p>箱の中を視線方向に進み、SDFが文字の面を示す場所でヒットします。step数を増やすほど細かく探索します。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section-pad code-section" aria-labelledby="code-title">
+      <div class="section-head">
+        <p class="eyebrow">Mental Model</p>
+        <h2 id="code-title">コードを読むときの入口</h2>
+        <p>
+          初心者が迷いやすいのは「どこで本物の3Dメッシュを作っているのか」です。
+          この実装では、CPUでUnityのMesh Assetを作るのではなく、GPUバッファとシェーダーで描画時に組み立てています。
+        </p>
+      </div>
+
+      <div class="code-lanes">
+        <pre><code>TMP text changed
+  -> read textInfo.meshInfo
+  -> collect visible character quads
+  -> pack position, uv, color, depth</code></pre>
+        <pre><code>Compute shader
+  -> one thread handles one quad
+  -> create front, back, side vertices
+  -> write vertex and index buffers</code></pre>
+        <pre><code>Render shader
+  -> fetch buffer by SV_VertexID
+  -> raymarch inside character box
+  -> sample SDF atlas and shade hit</code></pre>
+      </div>
+    </section>
+
+    <section class="band section-pad" id="map" aria-labelledby="map-title">
+      <div class="section-head">
+        <p class="eyebrow">Source Map</p>
+        <h2 id="map-title">Unityファイルと役割の対応表</h2>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ファイル</th>
+              <th>主な役割</th>
+              <th>初心者向けの読み方</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>`TMP3D_ComputeRenderer.cs`</td>
+              <td>TMPの文字情報をGPUバッファに渡し、描画を呼ぶ</td>
+              <td>CPU側の配線係。TMP、Compute、Materialをつなぐ。</td>
+            </tr>
+            <tr>
+              <td>`TMP3D_Extrude.compute`</td>
+              <td>4頂点の文字クワッドを16頂点の押し出し形状へ変換</td>
+              <td>薄い紙の文字に厚み用の箱を作る。</td>
+            </tr>
+            <tr>
+              <td>`TMP3D_ExtrudeRender.shader`</td>
+              <td>バッファを読み、SDFとレイマーチで文字表面を描く</td>
+              <td>箱の中を調べて、実際に見える面だけ塗る。</td>
+            </tr>
+            <tr>
+              <td>`TMP3D_Unlit.shader`</td>
+              <td>vendor TMP3Dの元実装。geometry shaderで押し出す</td>
+              <td>比較対象。compute版はこの考え方を別経路で実装している。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section-pad" id="constraints" aria-labelledby="constraints-title">
+      <div class="section-head">
+        <p class="eyebrow">Constraints</p>
+        <h2 id="constraints-title">普通のTextMeshProと違うところ</h2>
+        <p>
+          この仕組みはTextMeshProの文字情報を使いますが、通常のTMPと同じ感覚でフォントやマテリアルを差し替えられるわけではありません。
+          「文字の板」を3Dサンプル用の箱として扱うため、SDFアトラス、カスタムシェーダー、GPU機能に依存します。
+        </p>
+      </div>
+
+      <div class="constraint-grid">
+        <article class="constraint-card">
+          <span class="constraint-kicker">Font atlas</span>
+          <h3>SDFフォントが前提</h3>
+          <p>
+            レイマーチ中に `_MainTex` のSDF値を読むため、輪郭情報を持つTMP SDFフォントが必要です。
+            Bitmapフォントや解像度の低いアトラスでは、立体の輪郭や奥行き面が荒く見えます。
+          </p>
+        </article>
+        <article class="constraint-card">
+          <span class="constraint-kicker">Material</span>
+          <h3>通常のTMPマテリアルだけでは完結しない</h3>
+          <p>
+            `_FaceTex`、`_DepthAlbedo`、`_OutlineTex`、レイマーチ系パラメータなど、3D用の追加プロパティを使います。
+            新しいフォントを使う時は、フォントアセットだけでなく対応マテリアルも確認します。
+          </p>
+        </article>
+        <article class="constraint-card">
+          <span class="constraint-kicker">Component</span>
+          <h3>UIのTMPとは別物として考える</h3>
+          <p>
+            現在の `TMP3D_ComputeRenderer` は `TextMeshPro` コンポーネントを要求します。
+            `TextMeshProUGUI` をCanvas上でそのまま3D化する用途ではなく、ワールド空間のTMPを描く想定です。
+          </p>
+        </article>
+        <article class="constraint-card">
+          <span class="constraint-kicker">Glyph features</span>
+          <h3>リッチな文字機能は検証が必要</h3>
+          <p>
+            基本は「可視文字の4頂点クワッド」を処理します。fallbackフォント、絵文字、sprite glyph、underline、strikethrough、
+            複数マテリアル文字は、通常TMPと同じ見え方になるか個別確認が必要です。
+          </p>
+        </article>
+        <article class="constraint-card">
+          <span class="constraint-kicker">Platform</span>
+          <h3>Compute shaderとShader Model 5.0に依存</h3>
+          <p>
+            compute版はGPUバッファと `DrawProceduralNow`、描画シェーダーの `#pragma target 5.0` を使います。
+            WebGLや一部モバイルなど、compute対応が弱い環境では別方式やフォールバックを検討します。
+          </p>
+        </article>
+        <article class="constraint-card">
+          <span class="constraint-kicker">Rendering</span>
+          <h3>本物のメッシュ資産ではない</h3>
+          <p>
+            見た目は3Dですが、Unity上に編集可能な押し出しMeshを作っているわけではありません。
+            MeshCollider、メッシュ編集、ライトマップ用ジオメトリのような用途には向きません。
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="band section-pad" id="tradeoffs" aria-labelledby="tradeoffs-title">
+      <div class="section-head">
+        <p class="eyebrow">Polygon vs Raymarching</p>
+        <h2 id="tradeoffs-title">ポリゴン化とレイマーチング、どちらが楽か</h2>
+        <p>
+          3D文字には大きく分けて、文字の輪郭から本物のポリゴンを生成する方法と、この実装のように箱の中をSDFで探索する方法があります。
+          手軽さ、処理負荷、見た目の自由度はトレードオフです。
+        </p>
+      </div>
+
+      <div class="tradeoff-layout">
+        <article class="visual-panel">
+          <h3>2つの考え方</h3>
+          <canvas id="tradeoffStage" width="980" height="620" aria-label="ポリゴン方式とレイマーチング方式の比較図"></canvas>
+          <p>左は輪郭そのものを三角形化する考え方、右は押し出し箱の中でSDFを読む考え方です。</p>
+        </article>
+
+        <div class="decision-stack" aria-label="方式選定の要点">
+          <article class="decision-card polygon">
+            <h3>ポリゴン押し出しが向く場面</h3>
+            <ul>
+              <li>文字形状を本物のMeshとして扱いたい</li>
+              <li>物理、影、ライト、メッシュ編集が必要</li>
+              <li>静的なロゴや少数の文字を高品質に作り込みたい</li>
+            </ul>
+          </article>
+          <article class="decision-card ray">
+            <h3>今回の方式が向く場面</h3>
+            <ul>
+              <li>TMPのテキスト更新に追従しやすくしたい</li>
+              <li>フォント輪郭の三角形化を避けたい</li>
+              <li>Depth色、アウトライン、SDF由来の輪郭表現をシェーダーで調整したい</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+
+      <div class="table-wrap comparison-table">
+        <table>
+          <thead>
+            <tr>
+              <th>観点</th>
+              <th>ポリゴン化した3D文字</th>
+              <th>今回のレイマーチング方式</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>導入の手軽さ</td>
+              <td>フォント輪郭の取得、三角形分割、側面生成が必要。動的文字では実装量が増える。</td>
+              <td>TMPの4頂点クワッドとSDFアトラスを利用できる。フォント輪郭の直接処理を避けられる。</td>
+            </tr>
+            <tr>
+              <td>処理負荷</td>
+              <td>頂点数と三角形数が文字の複雑さに比例。生成時CPU負荷、描画時頂点負荷が中心。</td>
+              <td>形状は軽めだが、ピクセルごとに複数stepのSDFサンプルを行う。画面上で大きい文字ほど重くなりやすい。</td>
+            </tr>
+            <tr>
+              <td>見た目の品質</td>
+              <td>シルエットはポリゴン密度と三角形分割品質に依存。近距離でも実体感を出しやすい。</td>
+              <td>SDFとstep数に依存。輪郭、depth色、アウトラインをシェーダーで変えやすい。</td>
+            </tr>
+            <tr>
+              <td>Unity機能との相性</td>
+              <td>MeshRenderer、MeshCollider、影、ライト、ベイクなど標準機能に乗せやすい。</td>
+              <td>描画専用に近い。Colliderや編集可能Meshが必要な用途には追加実装が必要。</td>
+            </tr>
+            <tr>
+              <td>動的テキスト</td>
+              <td>文字変更ごとにメッシュ再生成が必要になりやすい。</td>
+              <td>TMPの変更イベントからGPUバッファを作り直せるため、カウントアップなどの演出と相性が良い。</td>
+            </tr>
+            <tr>
+              <td>プラットフォーム</td>
+              <td>通常メッシュなら対応範囲は広め。ただし生成コードやデータ量に注意。</td>
+              <td>compute shader、StructuredBuffer、Shader Model 5.0に依存。対象プラットフォーム確認が重要。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section-pad glossary" aria-labelledby="glossary-title">
+      <div class="section-head">
+        <p class="eyebrow">Glossary</p>
+        <h2 id="glossary-title">グラフィック初心者向けの用語</h2>
+      </div>
+      <div class="glossary-grid">
+        <details open>
+          <summary>SDF</summary>
+          <p>Signed Distance Fieldの略です。文字の輪郭を、ただの白黒画像ではなく「境界からの距離っぽい値」として持つので、拡大しても輪郭をきれいに出せます。</p>
+        </details>
+        <details>
+          <summary>Compute Shader</summary>
+          <p>頂点やピクセルを直接描く前に、GPUで汎用計算をする仕組みです。このサイトの例では、文字ごとの押し出し頂点をまとめて作ります。</p>
+        </details>
+        <details>
+          <summary>Raymarching</summary>
+          <p>光線を少しずつ前へ進めて、形に当たった場所を探す描き方です。三角形の表面だけでなく、ボリューム内の条件を見ながら表面を決められます。</p>
+        </details>
+        <details>
+          <summary>GraphicsBuffer</summary>
+          <p>GPUが読むための配列です。C#側で作った `GraphicsBuffer` をMaterialへ渡すことで、シェーダー内の `StructuredBuffer` から参照できます。</p>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Built as a static visual guide for this Unity project. Main references: `Assets/NariEffect/Text3DCounter/Scripts` and `Assets/NariEffect/Text3DCounter/Shaders`.</p>
+  </footer>
+
+  <noscript>
+    <p class="noscript">このページの図はJavaScriptで描画しています。ブラウザでJavaScriptを有効にしてください。</p>
+  </noscript>
+  <script src="app.js" defer></script>
+</body>
+</html>
